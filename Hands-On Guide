@@ -1,0 +1,291 @@
+# Serverless Image Moderation & Auto-Tagging Pipeline
+### Full Hands-On Build Guide — AWS Management Console (No CLI)
+
+---
+
+## Prerequisites
+- AWS account (free tier works)
+- Logged into the AWS Management Console
+- Region set to **US East (N. Virginia) us-east-1** in the top-right region dropdown (keep this consistent across every service below)
+
+---
+
+## Step 1 — Create the S3 Bucket
+
+1. Go to **S3** in the console → **Create bucket**
+2. Bucket name: `rekognition-demo-uploads-<yourname>` (must be globally unique — add initials/numbers)
+3. Region: US East (N. Virginia)
+4. Leave all other settings default → **Create bucket**
+5. Open the bucket → **Create folder** → name it `incoming`
+6. Create another folder → name it `quarantine`
+
+---
+
+## Step 2 — Create the DynamoDB Table
+
+1. Go to **DynamoDB** → **Tables** → **Create table**
+2. Table name: `ImageResults`
+3. Partition key: `imageId` (type: **String**)
+4. Table settings: leave on **Default settings** (on-demand capacity)
+5. **Create table**
+
+---
+
+## Step 3 — Create the SNS Topic (for moderation alerts)
+
+1. Go to **SNS** → **Topics** → **Create topic**
+2. Type: **Standard**
+3. Name: `image-moderation-alerts`
+4. **Create topic**
+5. On the topic page → **Create subscription**
+   - Protocol: **Email**
+   - Endpoint: your email address
+   - **Create subscription**
+6. Check your inbox and click **Confirm subscription**
+7. Copy the **Topic ARN** shown at the top of the topic page — you'll paste this into your Lambda code later
+
+---
+
+## Step 4 — Create the IAM Role for Lambda
+
+1. Go to **IAM** → **Roles** → **Create role**
+2. Trusted entity type: **AWS service**
+3. Use case: **Lambda** → **Next**
+4. Attach these permission policies (search and check each box):
+   - `AmazonS3FullAccess`
+   - `AmazonRekognitionFullAccess`
+   - `AmazonDynamoDBFullAccess`
+   - `AmazonSNSFullAccess`
+   - `AWSLambdaBasicExecutionRole`
+5. **Next** → Role name: `RekognitionLambdaRole` → **Create role**
+
+> ⚠️ `FullAccess` policies are fine to move fast for a demo project. For your README, note that scoping these down to least-privilege is a planned improvement — this shows security awareness to reviewers.
+
+---
+
+## Step 5 — Create the Lambda Function
+
+1. Go to **Lambda** → **Create function**
+2. Choose **Author from scratch**
+3. Function name: `RekognitionImageProcessor`
+4. Runtime: **Python 3.12**
+5. Architecture: x86_64
+6. Under **Permissions** → expand **Change default execution role** → select **Use an existing role** → choose `RekognitionLambdaRole`
+7. **Create function**
+
+Once created, scroll to the **Code** tab. Delete the placeholder code in `lambda_function.py` and paste this in:
+
+```python
+import boto3
+import json
+import uuid
+from datetime import datetime
+from urllib.parse import unquote_plus
+
+s3 = boto3.client('s3')
+rekognition = boto3.client('rekognition')
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+
+TABLE_NAME = "ImageResults"
+SNS_TOPIC_ARN = "REPLACE_WITH_YOUR_TOPIC_ARN"
+MODERATION_THRESHOLD = 80.0
+
+def lambda_handler(event, context):
+    table = dynamodb.Table(TABLE_NAME)
+
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key = unquote_plus(record['s3']['object']['key'])
+
+        if not key.startswith("incoming/"):
+            continue
+
+        image_id = str(uuid.uuid4())
+
+        # 1. Detect labels (auto-tagging)
+        label_response = rekognition.detect_labels(
+            Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+            MaxLabels=10,
+            MinConfidence=70
+        )
+        labels = [
+            {"name": l['Name'], "confidence": round(l['Confidence'], 2)}
+            for l in label_response['Labels']
+        ]
+
+        # 2. Detect moderation labels (content safety)
+        moderation_response = rekognition.detect_moderation_labels(
+            Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+            MinConfidence=60
+        )
+        moderation_labels = [
+            {"name": m['Name'], "confidence": round(m['Confidence'], 2)}
+            for m in moderation_response['ModerationLabels']
+        ]
+
+        is_flagged = any(
+            m['confidence'] >= MODERATION_THRESHOLD for m in moderation_labels
+        )
+
+        # 3. Store results in DynamoDB
+        table.put_item(Item={
+            "imageId": image_id,
+            "originalKey": key,
+            "bucket": bucket,
+            "labels": labels,
+            "moderationLabels": moderation_labels,
+            "flagged": is_flagged,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+        # 4. If flagged, move to quarantine + send SNS alert
+        if is_flagged:
+            new_key = key.replace("incoming/", "quarantine/")
+            s3.copy_object(
+                Bucket=bucket,
+                CopySource={'Bucket': bucket, 'Key': key},
+                Key=new_key
+            )
+            s3.delete_object(Bucket=bucket, Key=key)
+
+            sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject="Flagged Image Detected",
+                Message=f"Image {key} was flagged and moved to quarantine.\n"
+                        f"Labels: {json.dumps(moderation_labels, indent=2)}"
+            )
+
+        print(f"Processed {key} -> imageId {image_id}, flagged={is_flagged}")
+
+    return {"statusCode": 200, "body": "Processing complete"}
+```
+
+8. Replace `REPLACE_WITH_YOUR_TOPIC_ARN` with the SNS Topic ARN you copied in Step 3
+9. Click **Deploy** (top right of the code editor)
+
+Now increase the timeout (Rekognition calls can take a few seconds):
+1. Go to **Configuration** tab → **General configuration** → **Edit**
+2. Timeout: **30 sec**
+3. Memory: **256 MB**
+4. **Save**
+
+---
+
+## Step 6 — Connect S3 → Lambda Trigger
+
+1. Still inside the Lambda function → **Configuration** tab → **Triggers** → **Add trigger**
+2. Select **S3**
+3. Bucket: `rekognition-demo-uploads-<yourname>`
+4. Event type: **All object create events**
+5. Prefix: `incoming/`
+6. Check the acknowledgment box → **Add**
+
+This automatically grants S3 permission to invoke your Lambda — no manual permission step needed in the console.
+
+---
+
+## Step 7 — Test It
+
+1. Go back to **S3** → open your bucket → open the `incoming/` folder
+2. Click **Upload** → **Add files** → choose a test photo → **Upload**
+
+Check it worked:
+1. Go to **Lambda** → your function → **Monitor** tab → **View CloudWatch logs**
+2. Open the latest log stream — you should see `Processed incoming/yourfile.jpg -> imageId ..., flagged=False`
+
+Check DynamoDB:
+1. Go to **DynamoDB** → **Tables** → `ImageResults` → **Explore table items**
+2. You should see a new row with `labels`, `moderationLabels`, and `flagged: false`
+
+To test the moderation/alert path, upload an image with content Rekognition's moderation model would flag (e.g., a violent or explicit movie still — plenty of safe-for-work "borderline" test images exist online). Confirm:
+- The object disappears from `incoming/` and appears in `quarantine/`
+- You receive the SNS email alert
+- DynamoDB shows `flagged: true`
+
+---
+
+## Step 8 — Expose Results via API Gateway (Optional Polish)
+
+**8a. Create a second Lambda for reads**
+1. Lambda → **Create function** → Author from scratch
+2. Name: `GetImageResult`, Runtime: Python 3.12, Role: `RekognitionLambdaRole`
+3. Paste this code and **Deploy**:
+
+```python
+import boto3
+import json
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table("ImageResults")
+
+def lambda_handler(event, context):
+    image_id = event['pathParameters']['id']
+    response = table.get_item(Key={"imageId": image_id})
+    item = response.get('Item')
+
+    if not item:
+        return {"statusCode": 404, "body": json.dumps({"error": "Not found"})}
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(item)
+    }
+```
+
+**8b. Create the API**
+1. Go to **API Gateway** → **Create API** → **HTTP API** → **Build**
+2. Add integration: **Lambda** → select `GetImageResult`
+3. API name: `image-results-api` → **Next**
+4. Configure route: Method **GET**, path `/image/{id}` → **Next**
+5. Stage name: default `$default` → **Next** → **Create**
+6. Copy the **Invoke URL** shown on the API's main page
+
+**8c. Test it**
+- Open a browser or Postman and go to:
+  `https://<your-invoke-url>/image/<imageId>` (use a real `imageId` from your DynamoDB table)
+- You should get back the JSON record
+
+---
+
+## Step 9 — Record Your Demo
+
+For your portfolio/CV, capture:
+1. **Screen recording**: uploading a file in the S3 console → switching to CloudWatch logs to show it processing live
+2. **Screenshot**: DynamoDB item showing labels
+3. **Screenshot**: the SNS email alert for a flagged image
+4. **Architecture diagram** (use draw.io or Excalidraw — free and fast)
+
+**Architecture flow to diagram:**
+```
+User/App --> S3 (incoming/) --> Lambda --> Rekognition API
+                                    |
+                                    ├──> DynamoDB (store results)
+                                    └──> [if flagged] S3 (quarantine/) + SNS alert
+```
+
+---
+
+## Step 10 — Clean Up (avoid ongoing charges)
+
+Go through the console and delete, in this order:
+1. **API Gateway** → delete `image-results-api`
+2. **Lambda** → delete `RekognitionImageProcessor` and `GetImageResult`
+3. **DynamoDB** → delete table `ImageResults`
+4. **SNS** → delete topic `image-moderation-alerts`
+5. **S3** → empty the bucket (select bucket → **Empty**) → then delete the bucket
+6. **IAM** → delete role `RekognitionLambdaRole`
+
+---
+
+## What to Put in Your GitHub README
+
+- Project title + one-line summary
+- Architecture diagram
+- Tech stack list
+- Setup instructions (console steps, cleaned up, or link to this guide)
+- Screenshots/GIF of it working
+- "Future improvements" section (e.g., scoped IAM policies, face comparison for KYC, batch processing via SQS, Infrastructure-as-Code version using CloudFormation/Terraform)
+
+This structure signals to reviewers that you understand the *whole* lifecycle — not just calling an API, but designing, securing, testing, and documenting a real system.
