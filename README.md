@@ -150,8 +150,19 @@ Final testing confirmed the full pipeline works correctly:
 
 ---
 
-## Tech Stack Summary (for CV / resume)
+
+## Tech Stack Summary 
 
 **AWS Rekognition · AWS Lambda · Amazon S3 · Amazon DynamoDB · Amazon SNS · IAM · CloudWatch**
 
 > Built a serverless image moderation and auto-tagging pipeline using AWS Rekognition, Lambda, S3, and DynamoDB. Implemented automated content-safety flagging with quarantine handling and SNS email alerting. Debugged and resolved multiple real-world issues including DynamoDB Decimal-type serialization errors and Rekognition confidence-threshold filtering, verified through CloudWatch log analysis.
+
+## Reference (Demo)
+
+<img width="1917" height="973" alt="sns" src="https://github.com/user-attachments/assets/a8ade915-9559-4332-a978-5ccd570ed5b8" />
+<img width="1920" height="973" alt="s3" src="https://github.com/user-attachments/assets/dbed4841-e19d-4332-9197-91715fe4c91b" />
+<img width="1912" height="973" alt="quarantine" src="https://github.com/user-attachments/assets/0f429ba0-38f3-435a-b597-b73a0f7023b6" />
+<img width="1912" height="967" alt="lamda" src="https://github.com/user-attachments/assets/c7105712-5742-4b33-8a9b-fa6110720fc4" />
+<img width="1917" height="963" alt="incoming" src="https://github.com/user-attachments/assets/4bdb1ffa-3276-4887-b551-0b7377b0e6b2" />
+<img width="1918" height="966" alt="dynamo" src="https://github.com/user-attachments/assets/165a3e1d-a6b0-44c3-b261-d9e591e1d68d" />
+<img width="1918" height="971" alt="cloudwatch" src="https://github.com/user-attachments/assets/e872e05c-6eb9-49b6-8093-920bd2447a98" />
